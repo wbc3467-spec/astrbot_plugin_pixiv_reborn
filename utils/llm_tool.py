@@ -1102,6 +1102,182 @@ class PixivBookmarkTool(FunctionTool[AstrAgentContext]):
             return f"❌ 收藏失败喵：{error_str}"
 
 
+@dataclass
+class PixivUserIllustsTool(FunctionTool[AstrAgentContext]):
+    """
+    Pixiv画师作品浏览工具 - 获取指定画师的所有作品喵！
+    """
+
+    pixiv_client: Any = None
+    pixiv_config: Any = None
+    pixiv_client_wrapper: Any = None
+
+    name: str = "pixiv_user_illusts"
+    description: str = (
+        "【Pixiv画师作品浏览专用工具】用于查看Pixiv上指定画师的所有作品喵！"
+        "当用户想要：看某个画师的作品、浏览画师主页、找特定画师的图时，必须使用此工具喵！"
+        "支持通过画师ID（纯数字）或画师名搜索喵！"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "artist_id": {
+                    "type": "string",
+                    "description": "画师ID（纯数字），如 143260646 喵。如果不知道ID可以留空用artist_name搜喵",
+                    "default": "",
+                },
+                "artist_name": {
+                    "type": "string",
+                    "description": "画师名，如 '月うさぎ'、'コミ絵師' 喵。如果不知道ID可以用名字搜喵，但可能不精准喵",
+                    "default": "",
+                },
+                "count": {
+                    "type": "integer",
+                    "description": "想看几张喵？最多10张，默认5张喵",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "default": 5,
+                },
+            },
+        }
+    )
+
+    async def call(
+        self, context: ContextWrapper[AstrAgentContext], **kwargs
+    ) -> ToolExecResult:
+        try:
+            artist_id = kwargs.get("artist_id", "").strip()
+            artist_name = kwargs.get("artist_name", "").strip()
+            count = min(max(int(kwargs.get("count", 5)), 1), 10)
+
+            if not artist_id and not artist_name:
+                return "❌ 需要提供画师ID或画师名喵！(ΦωΦ;)✧"
+
+            if not self.pixiv_client:
+                return "❌ Pixiv客户端未初始化喵！"
+
+            if self.pixiv_client_wrapper and not await self.pixiv_client_wrapper.authenticate():
+                if self.pixiv_config and hasattr(self.pixiv_config, "get_auth_error_message"):
+                    return self.pixiv_config.get_auth_error_message()
+                return "❌ Pixiv API 认证失败喵！"
+
+            import asyncio
+
+            # 如果有名字没ID，先搜用户喵
+            if not artist_id and artist_name:
+                logger.info(f"Pixiv画师工具：通过名字 '{artist_name}' 搜索画师喵")
+                search_result = await asyncio.to_thread(
+                    self.pixiv_client.search_user, artist_name
+                )
+                if not search_result or not hasattr(search_result, "user_previews") or not search_result.user_previews:
+                    return f"❌ 未找到画师 '{artist_name}' 喵！(ΦωΦ;)✧"
+                artist_id = str(search_result.user_previews[0].user.id)
+                artist_name = search_result.user_previews[0].user.name
+                logger.info(f"找到画师：{artist_name} (ID: {artist_id})喵")
+
+            # 获取用户详情喵
+            user_detail = await asyncio.to_thread(
+                self.pixiv_client.user_detail, int(artist_id)
+            )
+            if not user_detail or not hasattr(user_detail, "user"):
+                return f"❌ 未找到画师 ID: {artist_id} 喵！(ΦωΦ;)✧"
+
+            user_name = user_detail.user.name
+
+            # 获取用户作品喵
+            user_illusts_result = await asyncio.to_thread(
+                self.pixiv_client.user_illusts, int(artist_id)
+            )
+            illusts = user_illusts_result.illusts if hasattr(user_illusts_result, "illusts") and user_illusts_result.illusts else []
+
+            if not illusts:
+                return f"画师 {user_name} ({artist_id}) 没有公开作品喵(ΦωΦ;)✧"
+
+            logger.info(f"找到画师 {user_name} 的 {len(illusts)} 张作品喵")
+
+            # 下载作品喵
+            from pathlib import Path
+            import aiohttp
+            from .pixiv_utils import get_proxied_image_url
+            from .tag import _extract_tag_names
+
+            save_dir = Path(__file__).parent.parent / "data" / "view_cache"
+            save_dir.mkdir(parents=True, exist_ok=True)
+
+            to_download = sorted(illusts, key=lambda x: getattr(x, "total_bookmarks", 0), reverse=True)[:count]
+            results = []
+
+            async with aiohttp.ClientSession() as session:
+                for i, ill in enumerate(to_download):
+                    url_obj = None
+                    if hasattr(ill, "meta_pages") and ill.meta_pages:
+                        url_obj = ill.meta_pages[0].image_urls
+                    else:
+                        class SinglePage:
+                            pass
+                        url_obj = SinglePage()
+                        url_obj.original = getattr(ill.meta_single_page, "original_image_url", None) if hasattr(ill, "meta_single_page") else None
+                        url_obj.large = getattr(ill.image_urls, "large", None) if hasattr(ill, "image_urls") else None
+                        url_obj.medium = getattr(ill.image_urls, "medium", None) if hasattr(ill, "image_urls") else None
+
+                    img_url = url_obj.original or url_obj.large or url_obj.medium
+                    if not img_url:
+                        continue
+
+                    proxied = get_proxied_image_url(img_url)
+
+                    try:
+                        async with session.get(proxied, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                            if resp.status == 200:
+                                data = await resp.read()
+                                safe_name = f"user_{ill.id}_p0.jpg"
+                                save_path = save_dir / safe_name
+                                with open(save_path, "wb") as f:
+                                    f.write(data)
+                                results.append({
+                                    "id": ill.id,
+                                    "title": ill.title,
+                                    "bookmarks": getattr(ill, "total_bookmarks", 0),
+                                    "path": str(save_path),
+                                    "size": len(data),
+                                })
+                    except Exception as e:
+                        logger.warning(f"下载画师作品 {ill.id} 失败: {e}")
+
+            if not results:
+                return f"找到作品但下载失败了喵(ΦωΦ;)✧"
+
+            tag_map = {}
+            for ill in to_download:
+                raw_tags = getattr(ill, "tags", None)
+                if raw_tags is not None:
+                    tag_names = _extract_tag_names(raw_tags)
+                    tag_map[ill.id] = tag_names
+
+            lines = []
+            profile_url = getattr(user_detail.user, "profile_image_urls", None)
+            avatar = f" ({profile_url.medium})" if profile_url and hasattr(profile_url, "medium") else ""
+            lines.append(f"🎨 画师: **{user_name}** (ID: {artist_id}){avatar}")
+            lines.append(f"📊 公开作品数: {len(illusts)} 张")
+            lines.append(f"📥 下载了热度前 {len(results)} 张喵！")
+            lines.append("")
+            for r in results:
+                size_kb = r["size"] / 1024
+                lines.append(f"  [{r['id']}] **{r['title']}** ({r['bookmarks']}⭐ {size_kb:.0f}KB)")
+                tag_list = tag_map.get(r["id"], [])
+                if tag_list:
+                    tag_str = "、".join(tag_list[:8])
+                    lines.append(f"  🏷️ {tag_str}")
+                lines.append(f"  路径喵: `{r['path']}`")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"Pixiv画师作品浏览失败: {e}")
+            return f"❌ 获取画师作品失败喵: {str(e)}"
+
+
 def create_pixiv_llm_tools(
     pixiv_client=None, pixiv_config=None, pixiv_client_wrapper=None
 ) -> List[FunctionTool]:
@@ -1133,6 +1309,11 @@ def create_pixiv_llm_tools(
             pixiv_client_wrapper=pixiv_client_wrapper,
         ),
         PixivBookmarkTool(
+            pixiv_client=pixiv_client,
+            pixiv_config=pixiv_config,
+            pixiv_client_wrapper=pixiv_client_wrapper,
+        ),
+        PixivUserIllustsTool(
             pixiv_client=pixiv_client,
             pixiv_config=pixiv_config,
             pixiv_client_wrapper=pixiv_client_wrapper,
