@@ -710,6 +710,11 @@ class PixivRankingTool(FunctionTool[AstrAgentContext]):
                     "description": "过滤条件：'safe'(仅全年龄)、'r18'(仅限制级)。默认不过滤，全返回喵。主人様可自行指定喵。注意：本喵不会自动加R-18排除喵！",
                     "default": "",
                 },
+                "output_mode": {
+                    "type": "string",
+                    "description": "输出模式：'send'=发送给用户（默认，主人様看图）；'view'=只下载给本喵自己看喵。设置view时不发图给主人様，而是保存到本地让本喵自己检查喵。",
+                    "default": "send",
+                },
             },
             "required": ["mode"],
         }
@@ -789,8 +794,12 @@ class PixivRankingTool(FunctionTool[AstrAgentContext]):
                     return f"R-18过滤后没有作品了喵(ΦωΦ;)✧"
                 logger.info(f"filters=r18过滤: {before}→{after} 张")
 
+            output_mode = kwargs.get("output_mode", "send")
+
             event = self._get_event(context)
-            if event:
+            if output_mode == "view":
+                return await self._download_for_view(illusts, mode, count)
+            elif event:
                 return await self._send_ranking_result(event, illusts, mode, count)
             else:
                 return self._format_text_results(illusts, mode, "")
@@ -871,6 +880,111 @@ class PixivRankingTool(FunctionTool[AstrAgentContext]):
         except Exception as e:
             logger.error(f"发送排行榜失败: {e}")
             return "获取排行榜成功但发送过程中出现异常喵(ΦωΦ;)✧"
+
+    async def _download_for_view(self, illusts, mode, count=1):
+        """下载排行榜图片到本地供本喵自己看喵"""
+        import asyncio
+        import aiohttp
+        import os
+        from pathlib import Path
+        from .tag import filter_illusts_with_reason, FilterConfig
+        from .pixiv_utils import get_proxied_image_url
+
+        save_dir = Path(__file__).parent.parent / "data" / "view_cache"
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        config = FilterConfig(
+            r18_mode=self.pixiv_config.r18_mode if self.pixiv_config else "允许 R18",
+            filter_r18g_only=self.pixiv_config.filter_r18g_only if self.pixiv_config else False,
+            ai_filter_mode=self.pixiv_config.ai_filter_mode if self.pixiv_config else "显示 AI 作品",
+            ai_detection_mode=self.pixiv_config.ai_detection_mode if self.pixiv_config else "field_or_tag",
+            display_tag_str=f"排行榜:{mode}",
+            return_count=count,
+            logger=logger,
+            show_filter_result=False,
+            single_response_mode=False,
+            excluded_tags=[],
+            forward_threshold=False,
+            show_details=False,
+        )
+        filtered, _ = filter_illusts_with_reason(illusts, config)
+        if not filtered:
+            return f"排行榜图被过滤了喵 (R18/AI) 排行: {mode}"
+
+        to_download = filtered[:count]
+        results = []
+
+        async with aiohttp.ClientSession() as session:
+            for i, ill in enumerate(to_download):
+                url_obj = None
+                if hasattr(ill, "meta_pages") and ill.meta_pages:
+                    url_obj = ill.meta_pages[0].image_urls
+                else:
+                    class SinglePage:
+                        pass
+                    url_obj = SinglePage()
+                    url_obj.original = getattr(ill.meta_single_page, "original_image_url", None) if hasattr(ill, "meta_single_page") else None
+                    url_obj.large = getattr(ill.image_urls, "large", None) if hasattr(ill, "image_urls") else None
+                    url_obj.medium = getattr(ill.image_urls, "medium", None) if hasattr(ill, "image_urls") else None
+
+                img_url = url_obj.original or url_obj.large or url_obj.medium
+                if not img_url:
+                    continue
+
+                proxied = get_proxied_image_url(img_url)
+
+                try:
+                    async with session.get(proxied, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                        if resp.status == 200:
+                            data = await resp.read()
+                            safe_name = f"ranking_{ill.id}_p0.jpg"
+                            save_path = save_dir / safe_name
+                            with open(save_path, "wb") as f:
+                                f.write(data)
+                            results.append({
+                                "id": ill.id,
+                                "title": ill.title,
+                                "user": ill.user.name if hasattr(ill, "user") else "未知",
+                                "bookmarks": getattr(ill, "total_bookmarks", 0),
+                                "path": str(save_path),
+                                "size": len(data),
+                            })
+                except Exception as e:
+                    logger.warning(f"下载排行图片 {ill.id} 失败: {e}")
+
+        if not results:
+            return f"下载失败喵，排行{mode}搜到{len(filtered)}张但都下不动喵"
+
+        from .tag import _extract_tag_names
+        tag_map = {}
+        for ill in to_download:
+            raw_tags = getattr(ill, "tags", None)
+            if raw_tags is not None:
+                tag_names = _extract_tag_names(raw_tags)
+                tag_map[ill.id] = tag_names
+
+        lines = []
+        mode_display = {
+            "day": "今日", "week": "本周", "month": "本月",
+            "day_male": "今日男性向", "day_female": "今日女性向",
+            "week_original": "本周原创", "week_rookie": "本周新人",
+            "day_manga": "今日漫画",
+            "day_r18": "今日R18", "day_male_r18": "今日R18男性向",
+            "day_female_r18": "今日R18女性向", "week_r18": "本周R18",
+            "week_r18g": "本周R18G",
+        }.get(mode, mode)
+        lines.append(f"📥 {mode_display}排行榜下载了 {len(results)} 张喵！")
+        lines.append("")
+        for r in results:
+            size_kb = r["size"] / 1024
+            lines.append(f"  [{r['id']}] **{r['title']}** by {r['user']} ({r['bookmarks']}⭐ {size_kb:.0f}KB)")
+            tag_list = tag_map.get(r["id"], [])
+            if tag_list:
+                tag_str = "、".join(tag_list[:10])
+                lines.append(f"  🏷️ {tag_str}")
+            lines.append(f"  路径喵: `{r['path']}`")
+
+        return "\n".join(lines)
 
     def _get_event(self, context):
         try:
