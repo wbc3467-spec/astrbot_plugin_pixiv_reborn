@@ -55,15 +55,35 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
                         "【必填】返回图片数量。"
                         "必须根据用户请求的数量填写！"
                         "例如：'来两张图'→count=2，'给我三张'→count=3，'来点图'→count=3。"
-                        "如果用户没有明确说数量，默认设为1。最小1，最大5。"
+                        "如果用户没有明确说数量，默认设为1。最小1，最大10。"
                     ),
                     "minimum": 1,
-                    "maximum": 5,
+                    "maximum": 10,
                     "default": 1,
+                },
+                "min_bookmarks": {
+                    "type": "integer",
+                    "description": "最低收藏数过滤，低于此数的作品不返回。例如：500 表示只返回收藏数>=500的图喵",
+                    "default": 0,
+                },
+                "duration": {
+                    "type": "string",
+                    "description": "时间范围：'all'(不限时间)、'within_last_day'(24小时内)、'within_last_week'(一周内)、'within_last_month'(一个月内)。默认'all'喵",
+                    "default": "all",
+                },
+                "exclude_tags": {
+                    "type": "string",
+                    "description": "排除指定标签，用逗号分隔。例如：'捆绑,触手' 表示搜到的结果中如果有这些标签就跳过喵",
+                    "default": "",
                 },
                 "filters": {
                     "type": "string",
-                    "description": "过滤条件：'safe'(全年龄)、'r18'(限制级)。默认为safe",
+                    "description": "过滤条件：'safe'(仅全年龄)、'r18'(仅限制级)。默认不过滤，全返回喵。主人様可自行指定喵。注意：本喵不会自动加R-18排除喵！",
+                },
+                "mode": {
+                    "type": "string",
+                    "description": "模式：'send'=发送给用户（默认，看图的人看）；'view'=只下载给本喵自己看喵。设置view时不发图给主人様，而是保存到本地让本喵自己检查喵。",
+                    "default": "send",
                 },
             },
             "required": ["query"],
@@ -75,7 +95,7 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
     ) -> ToolExecResult:
         try:
             query = kwargs.get("query", "")
-            count = min(max(int(kwargs.get("count", 1)), 1), 5)
+            count = min(max(int(kwargs.get("count", 1)), 1), 10)
             logger.info(f"Pixiv插画搜索工具：搜索 '{query}'，数量: {count}")
 
             if not self.pixiv_client:
@@ -92,15 +112,37 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
                 return "Pixiv API 认证失败，请检查配置中的凭据信息。"
 
             tags = query.strip()
-            return await self._search_illust(tags, query, context, count)
+            mode = kwargs.get("mode", "send")
+            min_bookmarks = int(kwargs.get("min_bookmarks", 0))
+            duration = kwargs.get("duration", "all")
+            exclude_tags = kwargs.get("exclude_tags", "")
+            filters = kwargs.get("filters", "")
+            return await self._search_illust(tags, query, context, count, mode, min_bookmarks, duration, exclude_tags, filters)
 
         except Exception as e:
             logger.error(f"Pixiv插画搜索失败: {e}")
             return f"搜索失败: {str(e)}"
 
-    async def _search_illust(self, tags, query, context, count=1):
-        """按热度（收藏数）搜索插画 - 一周内"""
+    async def _search_illust(self, tags, query, context, count=1, mode="send", min_bookmarks=0, duration="all", exclude_tags="", filters=""):
+        """按热度（收藏数）搜索插画，支持最低收藏数过滤、时间范围、排除标签和过滤条件喵"""
         import asyncio
+
+        # 中文标签→日语标签转换喵 (提高热门搜索命中率)
+        _tag_map = {
+            "猫娘": "猫耳",
+            "原神": "原神",
+            "初音未来": "初音ミク",
+            "可爱": "可愛い",
+            "女孩": "女の子",
+            "风景": "風景",
+            "风景": "風景",
+            "机甲": "メカ",
+            "机甲": "メカ",
+        }
+        orig_tags = tags
+        if tags in _tag_map:
+            tags = _tag_map[tags]
+            logger.info(f"标签翻译喵: {orig_tags} → {tags}")
 
         all_illusts = []
         page_count = 0
@@ -110,13 +152,16 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
         while page_count < pages_to_fetch:
             try:
                 if page_count == 0:
+                    # 根据duration动态设置时间范围喵
+                    kwargs_search = {
+                        "search_target": "partial_match_for_tags",
+                        "sort": "popular_desc",  # 按收藏数排序喵！
+                        "filter": "for_ios",
+                    }
+                    if duration != "all":
+                        kwargs_search["duration"] = duration
                     search_result = await asyncio.to_thread(
-                        self.pixiv_client.search_illust,
-                        tags,
-                        search_target="partial_match_for_tags",
-                        sort="date_desc",
-                        filter="for_ios",
-                        duration="within_last_week",  # 一周内
+                        self.pixiv_client.search_illust, tags, **kwargs_search
                     )
                 else:
                     if not next_params:
@@ -151,8 +196,51 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
             all_illusts, key=lambda x: getattr(x, "total_bookmarks", 0), reverse=True
         )
 
+        # 按最低收藏数过滤喵
+        if min_bookmarks > 0:
+            before = len(sorted_illusts)
+            sorted_illusts = [ill for ill in sorted_illusts if getattr(ill, "total_bookmarks", 0) >= min_bookmarks]
+            after = len(sorted_illusts)
+            if after == 0:
+                return f"收藏数 >= {min_bookmarks} 的作品太少了喵，试试降低 min_bookmarks 吧喵(ΦωФ;)✧"
+            logger.info(f"min_bookmarks过滤: {before}→{after} 张喵")
+
+        # 排除指定标签喵
+        if exclude_tags:
+            exclude_list = [t.strip() for t in exclude_tags.split(",") if t.strip()]
+            before = len(sorted_illusts)
+            sorted_illusts = [
+                ill for ill in sorted_illusts
+                if not any(
+                    excl.lower() in [t.name.lower() if hasattr(t, "name") else str(t).lower() for t in getattr(ill, "tags", [])]
+                    for excl in exclude_list
+                )
+            ]
+            after = len(sorted_illusts)
+            if after == 0:
+                return f"排除标签 '{exclude_tags}' 后没有剩余作品了喵，试试放宽排除条件喵(ΦωФ;)✧"
+            logger.info(f"排除标签 '{exclude_tags}' 过滤: {before}→{after} 张喵")
+
+        # filters过滤条件喵（本喵不自动加也不默认过滤！主人様自己指定喵）
+        if filters == "safe":
+            before = len(sorted_illusts)
+            sorted_illusts = [ill for ill in sorted_illusts if getattr(ill, "x_restrict", 0) == 0]
+            after = len(sorted_illusts)
+            if after == 0:
+                return f"全年龄过滤后没有作品了喵(ΦωΦ;)✧"
+            logger.info(f"filters=safe过滤: {before}→{after} 张喵")
+        elif filters == "r18":
+            before = len(sorted_illusts)
+            sorted_illusts = [ill for ill in sorted_illusts if getattr(ill, "x_restrict", 0) > 0]
+            after = len(sorted_illusts)
+            if after == 0:
+                return f"R-18过滤后没有作品了喵(ΦωΦ;)✧"
+            logger.info(f"filters=r18过滤: {before}→{after} 张喵")
+
         event = self._get_event(context)
-        if event:
+        if mode == "view":
+            return await self._download_for_view(sorted_illusts, tags, count)
+        elif event:
             return await self._send_pixiv_result(
                 event, sorted_illusts, query, tags, count
             )
@@ -225,6 +313,109 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
         except Exception as e:
             logger.error(f"发送失败: {e}")
             return "找到插画但发送过程中出现异常。"
+
+    async def _download_for_view(self, illusts, tags, count=1):
+        """下载图片到本地供本喵自己看喵，不发用户"""
+        import asyncio
+        import aiohttp
+        import os
+        from pathlib import Path
+
+        save_dir = Path(__file__).parent.parent / "data" / "view_cache"
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        # 先过滤（只保留符合配置的）
+        from .tag import filter_illusts_with_reason, FilterConfig
+        config = FilterConfig(
+            r18_mode=self.pixiv_config.r18_mode if self.pixiv_config else "允许 R18",
+            filter_r18g_only=self.pixiv_config.filter_r18g_only if self.pixiv_config else False,
+            ai_filter_mode=self.pixiv_config.ai_filter_mode if self.pixiv_config else "显示 AI 作品",
+            ai_detection_mode=self.pixiv_config.ai_detection_mode if self.pixiv_config else "field_or_tag",
+            display_tag_str=f"搜索:{tags}",
+            return_count=count,
+            logger=logger,
+            show_filter_result=False,
+            single_response_mode=False,
+            excluded_tags=[],
+            forward_threshold=False,
+            show_details=False,
+        )
+        filtered, _ = filter_illusts_with_reason(illusts, config)
+        if not filtered:
+            return f"搜到图但被过滤了喵 (R18/AI) 搜: {tags}"
+
+        # 取前 count 张
+        to_download = filtered[:count]
+        results = []
+
+        from .pixiv_utils import get_proxied_image_url
+
+        async with aiohttp.ClientSession() as session:
+            for i, ill in enumerate(to_download):
+                # 获取图片URL
+                url_obj = None
+                if hasattr(ill, "meta_pages") and ill.meta_pages:
+                    url_obj = ill.meta_pages[0].image_urls
+                else:
+                    class SinglePage:
+                        pass
+                    url_obj = SinglePage()
+                    url_obj.original = getattr(ill.meta_single_page, "original_image_url", None) if hasattr(ill, "meta_single_page") else None
+                    url_obj.large = getattr(ill.image_urls, "large", None) if hasattr(ill, "image_urls") else None
+                    url_obj.medium = getattr(ill.image_urls, "medium", None) if hasattr(ill, "image_urls") else None
+
+                img_url = url_obj.original or url_obj.large or url_obj.medium
+                if not img_url:
+                    continue
+
+                proxied = get_proxied_image_url(img_url)
+
+                try:
+                    async with session.get(proxied, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                        if resp.status == 200:
+                            data = await resp.read()
+                            safe_name = f"pixiv_{ill.id}_p0.jpg"
+                            save_path = save_dir / safe_name
+                            with open(save_path, "wb") as f:
+                                f.write(data)
+                            results.append({
+                                "id": ill.id,
+                                "title": ill.title,
+                                "user": ill.user.name if hasattr(ill, "user") else "未知",
+                                "bookmarks": getattr(ill, "total_bookmarks", 0),
+                                "path": str(save_path),
+                                "size": len(data),
+                            })
+                except Exception as e:
+                    logger.warning(f"下载图片 {ill.id} 失败: {e}")
+
+        if not results:
+            return f"下载失败喵，搜到{len(filtered)}张但都下不动喵"
+
+        # 构建标签映射（用tag模块的解析函数喵）
+        from .tag import _extract_tag_names
+        tag_map = {}
+        for ill in to_download:
+            raw_tags = getattr(ill, "tags", None)
+            if raw_tags is not None:
+                tag_names = _extract_tag_names(raw_tags)
+                tag_map[ill.id] = tag_names
+
+        lines = []
+        lines.append(f"📥 从Pixiv搜到 **{tags}** 喵！下载了 {len(results)} 张喵！")
+        lines.append("")
+        for r in results:
+            size_kb = r["size"] / 1024
+            lines.append(f"  [{r['id']}] **{r['title']}** by {r['user']} ({r['bookmarks']}⭐ {size_kb:.0f}KB)")
+            # 显示标签喵
+            tag_list = tag_map.get(r["id"], [])
+            if tag_list:
+                tag_str = "、".join(tag_list[:10])
+                lines.append(f"  🏷️ {tag_str}")
+            lines.append(f"  路径喵: `{r['path']}`")
+        lines.append("")
+        lines.append("本喵用 `astrbot_file_read_tool` 查看这些图喵！(ΦωФ)✧")
+        return "\n".join(lines)
 
     def _get_event(self, context):
         try:
