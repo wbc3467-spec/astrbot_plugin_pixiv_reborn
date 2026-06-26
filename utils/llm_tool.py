@@ -1006,6 +1006,102 @@ class PixivRankingTool(FunctionTool[AstrAgentContext]):
         return result
 
 
+@dataclass
+class PixivBookmarkTool(FunctionTool[AstrAgentContext]):
+    """
+    Pixiv收藏工具 - 在Pixiv上直接收藏插画到账号喵！
+    """
+
+    pixiv_client: Any = None
+    pixiv_config: Any = None
+    pixiv_client_wrapper: Any = None
+
+    name: str = "pixiv_bookmark_illust"
+    description: str = (
+        "【Pixiv收藏工具】用于在Pixiv上直接收藏/书签(bookmark)插画到自己的账号喵！"
+        "当搜到好看的图时，可以用此工具收藏到Pixiv账号的公开或非公开收藏夹喵。"
+        "使用前必须提供illust_id（插画ID）喵！"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "illust_id": {
+                    "type": "integer",
+                    "description": "要收藏的Pixiv插画ID喵！数字格式，如143260646喵",
+                },
+                "restrict": {
+                    "type": "string",
+                    "description": "收藏范围：'public'(公开收藏) 或 'private'(非公开收藏)。默认'public'喵",
+                    "default": "public",
+                    "enum": ["public", "private"],
+                },
+                "tags": {
+                    "type": "string",
+                    "description": "可选，收藏时添加的标签，多个标签用空格分隔喵",
+                    "default": "",
+                },
+            },
+            "required": ["illust_id"],
+        }
+    )
+
+    async def call(
+        self, context: ContextWrapper[AstrAgentContext], **kwargs
+    ) -> ToolExecResult:
+        try:
+            illust_id = kwargs.get("illust_id", 0)
+            restrict = kwargs.get("restrict", "public")
+            tags = kwargs.get("tags", None)
+
+            if not illust_id:
+                return "❌ 需要提供illust_id才能收藏喵！(ΦωΦ;)✧"
+
+            logger.info(f"Pixiv收藏工具：收藏插画 {illust_id}，范围: {restrict}")
+
+            if not self.pixiv_client:
+                return "❌ Pixiv客户端未初始化喵！(ΦωΦ;)✧"
+
+            if (
+                self.pixiv_client_wrapper
+                and not await self.pixiv_client_wrapper.authenticate()
+            ):
+                if self.pixiv_config and hasattr(
+                    self.pixiv_config, "get_auth_error_message"
+                ):
+                    return self.pixiv_config.get_auth_error_message()
+                return "❌ Pixiv API 认证失败，请检查配置中的凭据信息喵。"
+
+            import asyncio
+
+            # 处理tags
+            tag_list = None
+            if tags and tags.strip():
+                tag_list = tags.strip().split()
+
+            result = await asyncio.to_thread(
+                self.pixiv_client.illust_bookmark_add,
+                illust_id,
+                restrict=restrict,
+                tags=tag_list,
+            )
+
+            if result == {}:
+                return f"✨ 成功收藏插画 {illust_id} 到Pixiv账号喵！({'公开' if restrict == 'public' else '非公开'}收藏) (Φω´)✧✧"
+            else:
+                error_msg = str(result)
+                if "already" in error_msg.lower():
+                    return f"⚠️ 插画 {illust_id} 已经收藏过了喵！(ΦωΦ;)✧"
+                return f"❌ 收藏失败喵：{error_msg}"
+
+        except Exception as e:
+            error_str = str(e)
+            if "already bookmarked" in error_str.lower() or "already" in error_str.lower():
+                return f"⚠️ 插画 {kwargs.get('illust_id', '?')} 已经收藏过了喵！(ΦωΦ;)✧"
+            logger.error(f"Pixiv收藏失败: {e}")
+            return f"❌ 收藏失败喵：{error_str}"
+
+
 def create_pixiv_llm_tools(
     pixiv_client=None, pixiv_config=None, pixiv_client_wrapper=None
 ) -> List[FunctionTool]:
@@ -1032,6 +1128,11 @@ def create_pixiv_llm_tools(
             pixiv_client_wrapper=pixiv_client_wrapper,
         ),
         PixivRankingTool(
+            pixiv_client=pixiv_client,
+            pixiv_config=pixiv_config,
+            pixiv_client_wrapper=pixiv_client_wrapper,
+        ),
+        PixivBookmarkTool(
             pixiv_client=pixiv_client,
             pixiv_config=pixiv_config,
             pixiv_client_wrapper=pixiv_client_wrapper,
