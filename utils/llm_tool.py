@@ -658,6 +658,240 @@ class PixivNovelSearchTool(FunctionTool[AstrAgentContext]):
         return result
 
 
+@dataclass
+class PixivRankingTool(FunctionTool[AstrAgentContext]):
+    """
+    Pixiv排行榜查询工具
+    """
+
+    pixiv_client: Any = None
+    pixiv_config: Any = None
+    pixiv_client_wrapper: Any = None
+
+    name: str = "pixiv_ranking"
+    description: str = (
+        "【Pixiv排行榜查询专用工具】用于查看Pixiv上的官方排行榜（今日热门、本周热门等）。"
+        "当用户想要：热榜、排行榜、今日热门、本周热门、Pixiv热榜时，必须使用此工具。"
+        "此工具不按关键词搜索，而是返回Pixiv官方按热度排序的作品喵。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "description": (
+                        "排行榜模式：'day'(今日)、'week'(本周)、'month'(本月)、"
+                        "'day_male'(男性向)、'day_female'(女性向)、'week_original'(原创周榜)、"
+                        "'week_rookie'(新人周榜)、'day_manga'(漫画日榜)、"
+                        "'day_r18'(R18日榜)、'day_male_r18'(R18男性向)、'day_female_r18'(R18女性向)、"
+                        "'week_r18'(R18周榜)、'week_r18g'(R18G周榜)。"
+                        "默认'day'喵。"
+                    ),
+                    "default": "day",
+                },
+                "date": {
+                    "type": "string",
+                    "description": "日期，格式 YYYY-MM-DD，可选喵。不传则获取最新排行榜喵。",
+                    "default": "",
+                },
+                "count": {
+                    "type": "integer",
+                    "description": (
+                        "【必填】发送图片数量。"
+                        "如果用户没说数量，默认设为1喵。最小1，最大10喵。"
+                    ),
+                    "minimum": 1,
+                    "maximum": 10,
+                    "default": 1,
+                },
+                "filters": {
+                    "type": "string",
+                    "description": "过滤条件：'safe'(仅全年龄)、'r18'(仅限制级)。默认不过滤，全返回喵。主人様可自行指定喵。注意：本喵不会自动加R-18排除喵！",
+                    "default": "",
+                },
+            },
+            "required": ["mode"],
+        }
+    )
+
+    async def call(
+        self, context: ContextWrapper[AstrAgentContext], **kwargs
+    ) -> ToolExecResult:
+        try:
+            mode = kwargs.get("mode", "day")
+            date = kwargs.get("date", "") or None
+            count = min(max(int(kwargs.get("count", 1)), 1), 10)
+            filters = kwargs.get("filters", "")
+
+            logger.info(f"Pixiv排行榜工具：模式 '{mode}'，日期: {date or '最新'}")
+
+            if not self.pixiv_client:
+                return "错误: Pixiv客户端未初始化"
+
+            if (
+                self.pixiv_client_wrapper
+                and not await self.pixiv_client_wrapper.authenticate()
+            ):
+                if self.pixiv_config and hasattr(
+                    self.pixiv_config, "get_auth_error_message"
+                ):
+                    return self.pixiv_config.get_auth_error_message()
+                return "Pixiv API 认证失败，请检查配置中的凭据信息。"
+
+            # 验证模式
+            valid_modes = [
+                "day", "week", "month",
+                "day_male", "day_female", "week_original", "week_rookie", "day_manga",
+                "day_r18", "day_male_r18", "day_female_r18", "week_r18", "week_r18g",
+            ]
+            if mode not in valid_modes:
+                return f"无效的排行榜模式: {mode}喵。支持的: day, week, month, day_male, day_female, week_original, week_rookie, day_manga, day_r18, day_male_r18, day_female_r18, week_r18, week_r18g喵。"
+
+            # 检查R18权限
+            if "r18" in mode and self.pixiv_config and self.pixiv_config.r18_mode == "过滤 R18":
+                return "当前R18模式设为「过滤 R18」，无法使用R18相关排行榜喵(ΦωΦ;)✧"
+            if "r18g" in mode and self.pixiv_config and self.pixiv_config.filter_r18g_only:
+                return "当前已开启「额外过滤R18G」，无法使用R18G相关排行榜喵(ΦωΦ;)✧"
+
+            # 调用Pixiv API获取排行榜
+            import asyncio
+            ranking_result = await asyncio.to_thread(
+                self.pixiv_client.illust_ranking, mode=mode, date=date
+            )
+            illusts = ranking_result.illusts if ranking_result and hasattr(ranking_result, "illusts") else []
+
+            if not illusts:
+                return f"未能获取到{date or '最新'}的{mode}排行榜数据喵(ΦωΦ;)✧"
+
+            # 非manga模式过滤manga作品
+            if "manga" not in mode.lower():
+                before = len(illusts)
+                illusts = [i for i in illusts if getattr(i, "type", None) != "manga"]
+                after = len(illusts)
+                if after == 0:
+                    return f"{mode}排行榜结果均为漫画作品(manga)，已按非manga模式过滤喵(ΦωΦ;)✧"
+                logger.info(f"排行榜 {mode} 已过滤 {before - after} 个漫画作品")
+
+            # filters过滤
+            if filters == "safe":
+                before = len(illusts)
+                illusts = [i for i in illusts if getattr(i, "x_restrict", 0) == 0]
+                after = len(illusts)
+                if after == 0:
+                    return f"全年龄过滤后没有作品了喵(ΦωΦ;)✧"
+                logger.info(f"filters=safe过滤: {before}→{after} 张")
+            elif filters == "r18":
+                before = len(illusts)
+                illusts = [i for i in illusts if getattr(i, "x_restrict", 0) > 0]
+                after = len(illusts)
+                if after == 0:
+                    return f"R-18过滤后没有作品了喵(ΦωΦ;)✧"
+                logger.info(f"filters=r18过滤: {before}→{after} 张")
+
+            event = self._get_event(context)
+            if event:
+                return await self._send_ranking_result(event, illusts, mode, count)
+            else:
+                return self._format_text_results(illusts, mode, "")
+
+        except Exception as e:
+            logger.error(f"Pixiv排行榜查询失败: {e}")
+            return f"查询排行榜失败: {str(e)}"
+
+    async def _send_ranking_result(self, event, items, mode, count=1):
+        """发送排行榜结果"""
+        from .tag import build_detail_message, FilterConfig, filter_illusts_with_reason, process_and_send_illusts_sorted
+
+        logger.info(f"PixivRankingTool: 准备发送 {count} 张排行图片")
+        config = FilterConfig(
+            r18_mode=self.pixiv_config.r18_mode if self.pixiv_config else "过滤 R18",
+            filter_r18g_only=self.pixiv_config.filter_r18g_only
+            if self.pixiv_config else False,
+            ai_filter_mode=self.pixiv_config.ai_filter_mode
+            if self.pixiv_config else "过滤 AI 作品",
+            ai_detection_mode=self.pixiv_config.ai_detection_mode
+            if self.pixiv_config else "field_or_tag",
+            display_tag_str=f"排行榜:{mode}",
+            return_count=count,
+            logger=logger,
+            show_filter_result=False,
+            single_response_mode=self.pixiv_config.single_response_mode
+            if self.pixiv_config else False,
+            excluded_tags=[],
+            forward_threshold=self.pixiv_config.forward_threshold
+            if self.pixiv_config else False,
+            show_details=self.pixiv_config.show_details
+            if self.pixiv_config else True,
+        )
+
+        filtered_items, _ = filter_illusts_with_reason(items, config)
+        if not filtered_items:
+            return f"获取到排行榜但被过滤了 (可能是R18/AI作品)喵(ΦωΦ;)✧"
+
+        if not hasattr(event, "send"):
+            return self._format_text_results(filtered_items, mode, "")
+
+        expected_count = min(len(filtered_items), config.return_count)
+        sent_batches = 0
+
+        try:
+            async for result in process_and_send_illusts_sorted(
+                items,
+                config,
+                self.pixiv_client,
+                event,
+                build_detail_message,
+                send_pixiv_image,
+                send_forward_message,
+                is_novel=False,
+            ):
+                try:
+                    await event.send(result)
+                    sent_batches += 1
+                except Exception as e:
+                    logger.warning(f"发送排行图片失败: {e}")
+
+            if sent_batches > 0:
+                mode_display = {
+                    "day": "今日", "week": "本周", "month": "本月",
+                    "day_male": "今日男性向", "day_female": "今日女性向",
+                    "week_original": "本周原创", "week_rookie": "本周新人",
+                    "day_manga": "今日漫画",
+                    "day_r18": "今日R18", "day_male_r18": "今日R18男性向",
+                    "day_female_r18": "今日R18女性向", "week_r18": "本周R18",
+                    "week_r18g": "本周R18G",
+                }.get(mode, mode)
+                forward = "转发消息" if config.forward_threshold else "普通消息"
+                return (
+                    f"🔥 {mode_display}排行榜来了喵！"
+                    f" 发送了 {expected_count} 张作品 ({forward})。"
+                )
+            return "获取排行榜成功但发送失败喵，请稍后再试喵(ΦωΦ;)✧"
+        except Exception as e:
+            logger.error(f"发送排行榜失败: {e}")
+            return "获取排行榜成功但发送过程中出现异常喵(ΦωΦ;)✧"
+
+    def _get_event(self, context):
+        try:
+            agent_context = context.context if hasattr(context, "context") else context
+            if hasattr(context, "event") and context.event:
+                return context.event
+            elif hasattr(agent_context, "event") and agent_context.event:
+                return agent_context.event
+        except Exception:
+            pass
+        return None
+
+    def _format_text_results(self, items, mode, _):
+        result = f"找到{mode}排行榜作品:\n"
+        for i, item in enumerate(items[:5], 1):
+            title = getattr(item, "title", "未知标题")
+            author = getattr(item.user, "name", "未知作者") if hasattr(item, "user") else "未知作者"
+            result += f"{i}. {title} by {author} (ID: {item.id})\n"
+        return result
+
+
 def create_pixiv_llm_tools(
     pixiv_client=None, pixiv_config=None, pixiv_client_wrapper=None
 ) -> List[FunctionTool]:
@@ -679,6 +913,11 @@ def create_pixiv_llm_tools(
             pixiv_client_wrapper=pixiv_client_wrapper,
         ),
         PixivNovelSearchTool(
+            pixiv_client=pixiv_client,
+            pixiv_config=pixiv_config,
+            pixiv_client_wrapper=pixiv_client_wrapper,
+        ),
+        PixivRankingTool(
             pixiv_client=pixiv_client,
             pixiv_config=pixiv_config,
             pixiv_client_wrapper=pixiv_client_wrapper,
