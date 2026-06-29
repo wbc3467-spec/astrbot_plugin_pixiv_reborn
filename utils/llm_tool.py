@@ -1649,20 +1649,59 @@ class PixivMyBookmarksTool(FunctionTool[AstrAgentContext]):
 
             logger.info(f"Pixiv收藏查看工具：获取收藏列表 restrict={restrict}, offset={offset}")
 
-            # 获取用户收藏喵
-            bookmarks_result = await asyncio.to_thread(
-                self.pixiv_client.user_bookmarks_illust,
-                restrict=restrict,
-                offset=offset,
-            )
+            # 获取当前用户的user_id喵（pixivpy3在auth后保存了喵）
+            current_user_id = getattr(self.pixiv_client, 'user_id', None)
+            if not current_user_id:
+                return "❌ 无法获取当前用户ID喵！可能需要重新认证喵(ΦωФ;)✧"
 
-            illusts = []
-            if hasattr(bookmarks_result, "illusts") and bookmarks_result.illusts:
-                illusts = bookmarks_result.illusts
+            # 翻页获取收藏喵（pixivpy3用max_bookmark_id翻页，不支持offset喵）
+            all_illusts = []
+            max_bookmark_id = None
+            max_pages = 50  # 防止无限循环喵
 
+            while len(all_illusts) < offset + count and max_pages > 0:
+                max_pages -= 1
+                call_kwargs = {
+                    'user_id': current_user_id,
+                    'restrict': restrict,
+                }
+                if max_bookmark_id is not None:
+                    call_kwargs['max_bookmark_id'] = max_bookmark_id
+
+                bookmarks_result = await asyncio.to_thread(
+                    self.pixiv_client.user_bookmarks_illust,
+                    **call_kwargs,
+                )
+
+                page_illusts = []
+                if hasattr(bookmarks_result, "illusts") and bookmarks_result.illusts:
+                    page_illusts = bookmarks_result.illusts
+
+                if not page_illusts:
+                    break
+
+                all_illusts.extend(page_illusts)
+
+                # 解析next_url获取max_bookmark_id继续翻页喵
+                next_url = getattr(bookmarks_result, "next_url", None)
+                if not next_url:
+                    break
+
+                qs = self.pixiv_client.parse_qs(next_url)
+                if qs and "max_bookmark_id" in qs:
+                    max_bookmark_id = qs["max_bookmark_id"]
+                else:
+                    break
+
+            if not all_illusts:
+                restrict_display = "公开" if restrict == "public" else "非公开"
+                return f"{restrict_display}收藏夹为空喵(ΦωФ;)✧"
+
+            # 按offset截取喵
+            illusts = all_illusts[offset:offset + count] if offset < len(all_illusts) else []
             if not illusts:
                 restrict_display = "公开" if restrict == "public" else "非公开"
-                return f"{restrict_display}收藏夹里没有找到插画喵(ΦωФ;)✧ 可能offset调太大了喵～"
+                return f"offset={offset}超出了收藏总数{len(all_illusts)}喵(ΦωФ;)✧ 试试减小offset喵～"
 
             # 只取前count张喵
             to_show = illusts[:count]
