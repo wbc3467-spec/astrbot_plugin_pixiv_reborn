@@ -85,6 +85,12 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
                     "description": "模式：'send'=发送给用户（默认，看图的人看）；'view'=只下载给本喵自己看喵。设置view时不发图给主人様，而是保存到本地让本喵自己检查喵。",
                     "default": "send",
                 },
+                "offset": {
+                    "type": "integer",
+                    "description": "从第几张开始喵？从0开始计数，默认0（从头开始）喵。例如offset=5表示跳过前5张，从第6张开始看喵～用来翻页搜索更多作品喵！",
+                    "minimum": 0,
+                    "default": 0,
+                },
             },
             "required": ["query"],
         }
@@ -113,17 +119,18 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
 
             tags = query.strip()
             mode = kwargs.get("mode", "send")
+            offset = max(int(kwargs.get("offset", 0)), 0)
             min_bookmarks = int(kwargs.get("min_bookmarks", 0))
             duration = kwargs.get("duration", "all")
             exclude_tags = kwargs.get("exclude_tags", "")
             filters = kwargs.get("filters", "")
-            return await self._search_illust(tags, query, context, count, mode, min_bookmarks, duration, exclude_tags, filters)
+            return await self._search_illust(tags, query, context, count, mode, min_bookmarks, duration, exclude_tags, filters, offset)
 
         except Exception as e:
             logger.error(f"Pixiv插画搜索失败: {e}")
             return f"搜索失败: {str(e)}"
 
-    async def _search_illust(self, tags, query, context, count=1, mode="send", min_bookmarks=0, duration="all", exclude_tags="", filters=""):
+    async def _search_illust(self, tags, query, context, count=1, mode="send", min_bookmarks=0, duration="all", exclude_tags="", filters="", offset=0):
         """按热度（收藏数）搜索插画，支持最低收藏数过滤、时间范围、排除标签和过滤条件喵"""
         import asyncio
 
@@ -237,6 +244,14 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
                 return f"R-18过滤后没有作品了喵(ΦωΦ;)✧"
             logger.info(f"filters=r18过滤: {before}→{after} 张喵")
 
+        # offset翻页喵
+        if offset > 0:
+            before = len(sorted_illusts)
+            sorted_illusts = sorted_illusts[offset:]
+            logger.info(f"offset跳过前{offset}张: {before}→{len(sorted_illusts)} 张喵")
+        if not sorted_illusts:
+            return f"offset={offset} 超过作品总数了喵，试试调小offset喵(ΦωФ;)✧"
+
         event = self._get_event(context)
         if mode == "view":
             return await self._download_for_view(sorted_illusts, tags, count)
@@ -348,7 +363,7 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
         to_download = filtered[:count]
         results = []
 
-        from .pixiv_utils import get_proxied_image_url
+        from .pixiv_utils import get_proxied_image_url, download_image
 
         async with aiohttp.ClientSession() as session:
             for i, ill in enumerate(to_download):
@@ -378,13 +393,16 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
                             save_path = save_dir / safe_name
                             with open(save_path, "wb") as f:
                                 f.write(data)
+                            page_count = getattr(ill, "page_count", 1)
                             results.append({
                                 "id": ill.id,
                                 "title": ill.title,
                                 "user": ill.user.name if hasattr(ill, "user") else "未知",
+                                "user_id": ill.user.id if hasattr(ill, "user") and hasattr(ill.user, "id") else "未知",
                                 "bookmarks": getattr(ill, "total_bookmarks", 0),
                                 "path": str(save_path),
                                 "size": len(data),
+                                "page_count": page_count,
                             })
                 except Exception as e:
                     logger.warning(f"下载图片 {ill.id} 失败: {e}")
@@ -406,7 +424,8 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
         lines.append("")
         for r in results:
             size_kb = r["size"] / 1024
-            lines.append(f"  [{r['id']}] **{r['title']}** by {r['user']} ({r['bookmarks']}⭐ {size_kb:.0f}KB)")
+            page_info = f" 📄共{r['page_count']}页" if r.get("page_count", 1) > 1 else ""
+            lines.append(f"  [{r['id']}] **{r['title']}** by {r['user']} (UID:{r['user_id']}) ({r['bookmarks']}⭐ {size_kb:.0f}KB){page_info}")
             # 显示标签喵
             tag_list = tag_map.get(r["id"], [])
             if tag_list:
@@ -415,6 +434,8 @@ class PixivIllustSearchTool(FunctionTool[AstrAgentContext]):
             lines.append(f"  路径喵: `{r['path']}`")
         lines.append("")
         lines.append("本喵用 `astrbot_file_read_tool` 查看这些图喵！(ΦωФ)✧")
+        lines.append("💡 喜欢的话可以用 `pixiv_bookmark_illust` 收藏到Pixiv喵！")
+        lines.append("💡 也可以用 `steal_image_direct` 入库到贴纸库存喵！")
         return "\n".join(lines)
 
     def _get_event(self, context):
@@ -948,6 +969,7 @@ class PixivRankingTool(FunctionTool[AstrAgentContext]):
                                 "bookmarks": getattr(ill, "total_bookmarks", 0),
                                 "path": str(save_path),
                                 "size": len(data),
+                                "page_count": getattr(ill, "page_count", 1),
                             })
                 except Exception as e:
                     logger.warning(f"下载排行图片 {ill.id} 失败: {e}")
@@ -977,12 +999,16 @@ class PixivRankingTool(FunctionTool[AstrAgentContext]):
         lines.append("")
         for r in results:
             size_kb = r["size"] / 1024
-            lines.append(f"  [{r['id']}] **{r['title']}** by {r['user']} ({r['bookmarks']}⭐ {size_kb:.0f}KB)")
+            page_info = f" 📄共{r['page_count']}页" if r.get("page_count", 1) > 1 else ""
+            lines.append(f"  [{r['id']}] **{r['title']}** by {r['user']} ({r['bookmarks']}⭐ {size_kb:.0f}KB){page_info}")
             tag_list = tag_map.get(r["id"], [])
             if tag_list:
                 tag_str = "、".join(tag_list[:10])
                 lines.append(f"  🏷️ {tag_str}")
             lines.append(f"  路径喵: `{r['path']}`")
+        lines.append("")
+        lines.append("💡 喜欢的话可以用 `pixiv_bookmark_illust` 收藏到Pixiv喵！")
+        lines.append("💡 也可以用 `steal_image_direct` 入库到贴纸库存喵！")
 
         return "\n".join(lines)
 
@@ -1124,13 +1150,11 @@ class PixivUserIllustsTool(FunctionTool[AstrAgentContext]):
             "properties": {
                 "artist_id": {
                     "type": "string",
-                    "description": "画师ID（纯数字），如 143260646 喵。如果不知道ID可以留空用artist_name搜喵",
-                    "default": "",
+                    "description": "【必填·二选一】画师ID（纯数字），如 143260646 喵。注意：虽然本参数有默认值但它是必须传的！必须传artist_id或artist_name，否则工具会报错喵！",
                 },
                 "artist_name": {
                     "type": "string",
-                    "description": "画师名，如 '月うさぎ'、'コミ絵師' 喵。如果不知道ID可以用名字搜喵，但可能不精准喵",
-                    "default": "",
+                    "description": "【必填·二选一】画师名，如 '月うさぎ'、'コミ絵師' 喵。注意：虽然本参数有默认值但它是必须传的！必须传artist_id或artist_name，否则工具会报错喵！不知道ID时用这个搜喵，但可能不精准喵",
                 },
                 "count": {
                     "type": "integer",
@@ -1138,6 +1162,12 @@ class PixivUserIllustsTool(FunctionTool[AstrAgentContext]):
                     "minimum": 1,
                     "maximum": 10,
                     "default": 5,
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "从第几张开始喵？从0开始计数，默认0（从头开始）喵。例如offset=5表示跳过前5张，从第6张开始看喵～用来翻页看更多作品喵！",
+                    "minimum": 0,
+                    "default": 0,
                 },
             },
         }
@@ -1150,6 +1180,7 @@ class PixivUserIllustsTool(FunctionTool[AstrAgentContext]):
             artist_id = kwargs.get("artist_id", "").strip()
             artist_name = kwargs.get("artist_name", "").strip()
             count = min(max(int(kwargs.get("count", 5)), 1), 10)
+            offset = max(int(kwargs.get("offset", 0)), 0)
 
             if not artist_id and not artist_name:
                 return "❌ 需要提供画师ID或画师名喵！(ΦωΦ;)✧"
@@ -1185,16 +1216,43 @@ class PixivUserIllustsTool(FunctionTool[AstrAgentContext]):
 
             user_name = user_detail.user.name
 
-            # 获取用户作品喵
-            user_illusts_result = await asyncio.to_thread(
-                self.pixiv_client.user_illusts, int(artist_id)
-            )
-            illusts = user_illusts_result.illusts if hasattr(user_illusts_result, "illusts") and user_illusts_result.illusts else []
+            # 获取用户作品喵（用next_url翻页获取所有作品喵）
+            all_illusts = []
+            current_offset = 0
+            max_pages = 20  # 最多翻20页防止无限循环喵
+            page_count = 0
+            
+            while len(all_illusts) < offset + count and page_count < max_pages:
+                user_illusts_result = await asyncio.to_thread(
+                    self.pixiv_client.user_illusts, int(artist_id), offset=current_offset, filter=''
+                )
+                page_illusts = user_illusts_result.illusts if hasattr(user_illusts_result, "illusts") and user_illusts_result.illusts else []
+                
+                if not page_illusts:
+                    break
+                    
+                all_illusts.extend(page_illusts)
+                page_count += 1
+                
+                # 检查是否有next_url继续翻页喵
+                next_url = getattr(user_illusts_result, "next_url", None)
+                if not next_url:
+                    break
+                    
+                # 从next_url中提取offset继续翻页喵
+                qs = self.pixiv_client.parse_qs(next_url)
+                if qs and "offset" in qs:
+                    current_offset = int(qs["offset"])
+                else:
+                    current_offset += len(page_illusts)
+            
+            # 按offset截取需要的范围喵
+            illusts = all_illusts[offset:offset + count] if offset < len(all_illusts) else []
 
             if not illusts:
                 return f"画师 {user_name} ({artist_id}) 没有公开作品喵(ΦωΦ;)✧"
 
-            logger.info(f"找到画师 {user_name} 的 {len(illusts)} 张作品喵")
+            logger.info(f"找到画师 {user_name} 的 {len(all_illusts)} 张作品喵（offset={offset}, count={count}）")
 
             # 下载作品喵
             from pathlib import Path
@@ -1205,7 +1263,7 @@ class PixivUserIllustsTool(FunctionTool[AstrAgentContext]):
             save_dir = Path(__file__).parent.parent / "data" / "view_cache"
             save_dir.mkdir(parents=True, exist_ok=True)
 
-            to_download = sorted(illusts, key=lambda x: getattr(x, "total_bookmarks", 0), reverse=True)[:count]
+            to_download = illusts[:count]
             results = []
 
             async with aiohttp.ClientSession() as session:
@@ -1241,6 +1299,7 @@ class PixivUserIllustsTool(FunctionTool[AstrAgentContext]):
                                     "bookmarks": getattr(ill, "total_bookmarks", 0),
                                     "path": str(save_path),
                                     "size": len(data),
+                                    "page_count": getattr(ill, "page_count", 1),
                                 })
                     except Exception as e:
                         logger.warning(f"下载画师作品 {ill.id} 失败: {e}")
@@ -1260,22 +1319,204 @@ class PixivUserIllustsTool(FunctionTool[AstrAgentContext]):
             avatar = f" ({profile_url.medium})" if profile_url and hasattr(profile_url, "medium") else ""
             lines.append(f"🎨 画师: **{user_name}** (ID: {artist_id}){avatar}")
             lines.append(f"📊 公开作品数: {len(illusts)} 张")
-            lines.append(f"📥 下载了热度前 {len(results)} 张喵！")
+            lines.append(f"📥 下载了从第{offset}张开始的{len(results)}张作品喵！")
             lines.append("")
             for r in results:
                 size_kb = r["size"] / 1024
-                lines.append(f"  [{r['id']}] **{r['title']}** ({r['bookmarks']}⭐ {size_kb:.0f}KB)")
+                page_info = f" 📄共{r['page_count']}页" if r.get("page_count", 1) > 1 else ""
+                lines.append(f"  [{r['id']}] **{r['title']}** ({r['bookmarks']}⭐ {size_kb:.0f}KB){page_info}")
                 tag_list = tag_map.get(r["id"], [])
                 if tag_list:
                     tag_str = "、".join(tag_list[:8])
                     lines.append(f"  🏷️ {tag_str}")
                 lines.append(f"  路径喵: `{r['path']}`")
 
+            lines.append("")
+            lines.append("💡 喜欢的话可以用 `pixiv_bookmark_illust` 收藏到Pixiv喵！")
+            lines.append("💡 也可以用 `steal_image_direct` 入库到贴纸库存喵！")
             return "\n".join(lines)
 
         except Exception as e:
             logger.error(f"Pixiv画师作品浏览失败: {e}")
             return f"❌ 获取画师作品失败喵: {str(e)}"
+
+
+@dataclass
+class PixivDownloadPagesTool(FunctionTool[AstrAgentContext]):
+    """
+    Pixiv作品多页下载工具 - 下载指定作品的指定页喵！
+    """
+
+    pixiv_client: Any = None
+    pixiv_config: Any = None
+    pixiv_client_wrapper: Any = None
+
+    name: str = "pixiv_download_pages"
+    description: str = (
+        "【Pixiv作品多页下载工具】用于下载Pixiv作品的指定页面喵！"
+        "当看到提示'📄共X页'的作品想继续看后面的图时，使用此工具喵！"
+        "需要提供作品ID(illust_id)、起始页和下载数量喵！"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "illust_id": {
+                    "type": "integer",
+                    "description": "Pixiv作品ID喵！数字格式，如96053019喵",
+                },
+                "start_page": {
+                    "type": "integer",
+                    "description": "起始页数喵！从0开始，0=第一页。默认0喵",
+                    "default": 0,
+                },
+                "count": {
+                    "type": "integer",
+                    "description": "要下载几页喵！默认1喵",
+                    "default": 1,
+                    "minimum": 1,
+                    "maximum": 20,
+                },
+            },
+            "required": ["illust_id"],
+        }
+    )
+
+    async def call(
+        self, context: ContextWrapper[AstrAgentContext], **kwargs
+    ) -> ToolExecResult:
+        try:
+            illust_id = kwargs.get("illust_id", 0)
+            start_page = kwargs.get("start_page", 0)
+            count = kwargs.get("count", 1)
+
+            if not illust_id:
+                return "❌ 需要提供illust_id才能下载喵！(ΦωΦ;)✧"
+
+            import asyncio
+            import os
+            from pathlib import Path
+
+            # 获取作品详情喵
+            detail = await asyncio.to_thread(
+                self.pixiv_client.illust_detail, int(illust_id)
+            )
+            if not detail or not hasattr(detail, "illust"):
+                return f"❌ 未找到作品 {illust_id} 喵！(ΦωΦ;)✧"
+
+            illust = detail.illust
+            page_count = getattr(illust, "page_count", 1)
+
+            if start_page >= page_count:
+                return f"⚠️ 起始页{start_page}超出总页数{page_count}喵！(ΦωΦ;)✧"
+
+            save_dir = Path(__file__).parent.parent / "data" / "view_cache"
+            save_dir.mkdir(parents=True, exist_ok=True)
+
+            results = []
+            end_page = min(start_page + count, page_count)
+
+            # 获取所有页的URL喵
+            pages_urls = []
+            if hasattr(illust, "meta_pages") and illust.meta_pages:
+                for mp in illust.meta_pages:
+                    if hasattr(mp, "image_urls"):
+                        u = mp.image_urls
+                        img_url = (
+                            getattr(u, "original", None)
+                            or getattr(u, "large", None)
+                            or getattr(u, "medium", None)
+                        )
+                        pages_urls.append(img_url)
+            else:
+                if hasattr(illust, "meta_single_page"):
+                    img_url = getattr(
+                        illust.meta_single_page, "original_image_url", None
+                    )
+                else:
+                    img_url = None
+                if not img_url:
+                    img_url = (
+                        getattr(illust.image_urls, "large", None)
+                        or getattr(illust.image_urls, "medium", None)
+                    )
+                pages_urls.append(img_url)
+
+            if not pages_urls:
+                return f"❌ 获取作品 {illust_id} 的图片URL失败喵！(ΦωΦ;)✧"
+
+            for page_idx in range(start_page, end_page):
+                    if page_idx >= len(pages_urls):
+                        break
+                    img_url = pages_urls[page_idx]
+                    if not img_url:
+                        continue
+
+                    try:
+                        safe_name = f"page_{illust_id}_p{page_idx}.jpg"
+                        save_path = save_dir / safe_name
+                        success = await asyncio.to_thread(
+                            self.pixiv_client.download,
+                            img_url,
+                            path=str(save_dir),
+                            name=safe_name,
+                            replace=True,
+                        )
+                        if success and save_path.exists():
+                            size = save_path.stat().st_size
+                            results.append(
+                                {
+                                    "page": page_idx,
+                                    "path": str(save_path),
+                                    "size": size,
+                                }
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"下载作品{illust_id}第{page_idx}页失败: {e}"
+                        )
+
+            if not results:
+                return f"❌ 下载失败喵！(ΦωΦ;)✧"
+
+            lines = []
+            title = getattr(illust, "title", f"作品{illust_id}")
+            # 画师信息喵
+            artist_name = getattr(illust.user, "name", "未知") if hasattr(illust, "user") else "未知"
+            artist_id = getattr(illust.user, "id", "未知") if hasattr(illust, "user") else "未知"
+            # 收藏/浏览数喵
+            bookmarks = getattr(illust, "total_bookmarks", 0)
+            views = getattr(illust, "total_view", 0)
+            # 标签喵
+            tags_list = []
+            if hasattr(illust, "tags"):
+                for t in illust.tags:
+                    if hasattr(t, "name"):
+                        tags_list.append(t.name)
+            tags_str = "、".join(tags_list[:10])  # 最多显示10个标签喵
+            lines.append(
+                f"📥 **{title}** by {artist_name} (ID:{artist_id}) | ⭐{bookmarks} 👁️{views} | 📄共{page_count}页喵！"
+            )
+            lines.append(
+                f"📄 已下载第{start_page}-{end_page-1}页（共{page_count}页）喵！"
+            )
+            if tags_str:
+                lines.append(f"🏷️ {tags_str}")
+            lines.append("")
+            for r in results:
+                size_kb = r["size"] / 1024
+                lines.append(
+                    f"  📄 第{r['page']}页 ({size_kb:.0f}KB) 路径喵: `{r['path']}`"
+                )
+            lines.append("")
+            lines.append(
+                "💡 可以用 `astrbot_file_read_tool` 查看这些图喵！(ΦωФ)✧"
+            )
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"下载作品多页失败: {e}")
+            return f"❌ 下载失败喵：{str(e)}"
 
 
 def create_pixiv_llm_tools(
@@ -1318,6 +1559,269 @@ def create_pixiv_llm_tools(
             pixiv_config=pixiv_config,
             pixiv_client_wrapper=pixiv_client_wrapper,
         ),
+        PixivDownloadPagesTool(
+            pixiv_client=pixiv_client,
+            pixiv_config=pixiv_config,
+            pixiv_client_wrapper=pixiv_client_wrapper,
+        ),
+        PixivMyBookmarksTool(
+            pixiv_client=pixiv_client,
+            pixiv_config=pixiv_config,
+            pixiv_client_wrapper=pixiv_client_wrapper,
+        ),
     ]
     logger.info(f"已创建 {len(tools)} 个LLM工具")
     return tools
+
+
+@dataclass
+class PixivMyBookmarksTool(FunctionTool[AstrAgentContext]):
+    """查看自己的Pixiv收藏插画喵！"""
+    pixiv_client: Any = None
+    pixiv_config: Any = None
+    pixiv_client_wrapper: Any = None
+
+    name: str = "pixiv_my_bookmarks"
+    description: str = (
+        "【Pixiv收藏查看工具】用于查看自己Pixiv账号的收藏/书签列表喵！"
+        "当主人様想看自己收藏了什么图时，使用此工具喵。"
+        "可以查看公开或非公开收藏喵。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "restrict": {
+                    "type": "string",
+                    "description": "收藏范围：'public'(公开收藏) 或 'private'(非公开收藏)。默认'public'喵",
+                    "default": "public",
+                    "enum": ["public", "private"],
+                },
+                "count": {
+                    "type": "integer",
+                    "description": "想看几张喵？最多10张，默认3张喵",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "default": 3,
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "从第几张开始喵？从0开始计数，默认0（从头开始）喵。例如offset=5表示跳过前5张，从第6张开始看喵～用来翻页看更多收藏喵！",
+                    "minimum": 0,
+                    "default": 0,
+                },
+                "output_mode": {
+                    "type": "string",
+                    "enum": ["send", "view"],
+                    "description": "输出模式：'send'=发送给主人様（默认，主人様看图）；'view'=只下载给本喵自己看喵。设置view时不发图给主人様，而是保存到本地让本喵自己检查喵。",
+                    "default": "send",
+                },
+            },
+            "required": [],
+        }
+    )
+
+    async def call(
+        self, context: ContextWrapper[AstrAgentContext], **kwargs
+    ) -> ToolExecResult:
+        try:
+            restrict = kwargs.get("restrict", "public")
+            count = int(kwargs.get("count", 3))
+            offset = int(kwargs.get("offset", 0))
+            output_mode = kwargs.get("output_mode", "send")
+
+            if not self.pixiv_client:
+                return "❌ Pixiv客户端未初始化喵！(ΦωΦ;)✧"
+
+            if (
+                self.pixiv_client_wrapper
+                and not await self.pixiv_client_wrapper.authenticate()
+            ):
+                if self.pixiv_config and hasattr(
+                    self.pixiv_config, "get_auth_error_message"
+                ):
+                    return self.pixiv_config.get_auth_error_message()
+                return "❌ Pixiv API 认证失败，请检查配置中的凭据信息喵。"
+
+            import asyncio
+            import os
+            from pathlib import Path
+
+            logger.info(f"Pixiv收藏查看工具：获取收藏列表 restrict={restrict}, offset={offset}")
+
+            # 获取用户收藏喵
+            bookmarks_result = await asyncio.to_thread(
+                self.pixiv_client.user_bookmarks_illust,
+                restrict=restrict,
+                offset=offset,
+            )
+
+            illusts = []
+            if hasattr(bookmarks_result, "illusts") and bookmarks_result.illusts:
+                illusts = bookmarks_result.illusts
+
+            if not illusts:
+                restrict_display = "公开" if restrict == "public" else "非公开"
+                return f"{restrict_display}收藏夹里没有找到插画喵(ΦωФ;)✧ 可能offset调太大了喵～"
+
+            # 只取前count张喵
+            to_show = illusts[:count]
+
+            if output_mode == "view":
+                # 下载到本地让本喵自己看喵
+                save_dir = Path(__file__).parent.parent / "data" / "view_cache"
+                save_dir.mkdir(parents=True, exist_ok=True)
+
+                results = []
+                for ill in to_show:
+                    # 获取图片URL喵
+                    img_url = None
+                    if hasattr(ill, "meta_single_page"):
+                        img_url = getattr(
+                            ill.meta_single_page, "original_image_url", None
+                        )
+                    if not img_url and hasattr(ill, "image_urls"):
+                        img_url = (
+                            getattr(ill.image_urls, "large", None)
+                            or getattr(ill.image_urls, "medium", None)
+                        )
+                    if not img_url:
+                        continue
+
+                    safe_name = f"bookmark_{ill.id}.jpg"
+                    save_path = save_dir / safe_name
+                    try:
+                        success = await asyncio.to_thread(
+                            self.pixiv_client.download,
+                            img_url,
+                            path=str(save_dir),
+                            name=safe_name,
+                            replace=True,
+                        )
+                        if success and save_path.exists():
+                            size = save_path.stat().st_size
+                            results.append({
+                                "id": ill.id,
+                                "title": ill.title,
+                                "path": str(save_path),
+                                "size": size,
+                            })
+                    except Exception as e:
+                        logger.warning(f"下载收藏插画 {ill.id} 失败: {e}")
+                        continue
+
+                if not results:
+                    return f"下载收藏插画失败喵(ΦωФ;)✧"
+
+                restrict_display = "公开" if restrict == "public" else "非公开"
+                lines = [f"📚 本喵的{restrict_display}收藏喵 (offset={offset})："]
+                for r in results:
+                    size_kb = r["size"] / 1024
+                    lines.append(f"  [{r['id']}] **{r['title']}** ({size_kb:.0f}KB)")
+                    lines.append(f"  路径喵: `{r['path']}`")
+                lines.append("")
+                lines.append("本喵用 `astrbot_file_read_tool` 查看这些图喵！(ΦωФ)✧")
+                return "\n".join(lines)
+
+            else:
+                # send模式喵 — 用pixiv_reborn的发送机制喵
+                event = self._get_event(context)
+                if not event or not hasattr(event, "send"):
+                    # 没有event就返回文字信息喵
+                    restrict_display = "公开" if restrict == "public" else "非公开"
+                    lines = [f"📚 {restrict_display}收藏喵 (offset={offset})："]
+                    for ill in to_show:
+                        title = getattr(ill, "title", "未命名")
+                        user_name = getattr(getattr(ill, "user", None), "name", "未知")
+                        lines.append(f"  [{ill.id}] {title} by {user_name}")
+                    return "\n".join(lines)
+
+                # 用排行榜相同的发送机制喵
+                from .tag import (
+                    build_detail_message,
+                    FilterConfig,
+                    filter_illusts_with_reason,
+                    process_and_send_illusts_sorted,
+                )
+                from .pixiv_utils import send_pixiv_image, send_forward_message
+
+                display_tag_str = f"收藏:{restrict}"
+                config = FilterConfig(
+                    r18_mode=self.pixiv_config.r18_mode if self.pixiv_config else "允许 R18",
+                    filter_r18g_only=self.pixiv_config.filter_r18g_only
+                    if self.pixiv_config else False,
+                    ai_filter_mode=self.pixiv_config.ai_filter_mode
+                    if self.pixiv_config else "显示 AI 作品",
+                    ai_detection_mode=self.pixiv_config.ai_detection_mode
+                    if self.pixiv_config else "field_or_tag",
+                    display_tag_str=display_tag_str,
+                    return_count=count,
+                    logger=logger,
+                    show_filter_result=False,
+                    single_response_mode=self.pixiv_config.single_response_mode
+                    if self.pixiv_config else False,
+                    excluded_tags=[],
+                    forward_threshold=self.pixiv_config.forward_threshold
+                    if self.pixiv_config else False,
+                    show_details=self.pixiv_config.show_details
+                    if self.pixiv_config else True,
+                )
+
+                filtered_items, _ = filter_illusts_with_reason(to_show, config)
+                if not filtered_items:
+                    return f"获取到收藏但被过滤了喵(ΦωФ;)✧"
+
+                sent_batches = 0
+                try:
+                    async for result in process_and_send_illusts_sorted(
+                        to_show,
+                        config,
+                        self.pixiv_client,
+                        event,
+                        build_detail_message,
+                        send_pixiv_image,
+                        send_forward_message,
+                        is_novel=False,
+                    ):
+                        try:
+                            await event.send(result)
+                            sent_batches += 1
+                        except Exception as e:
+                            logger.warning(f"发送收藏图片失败: {e}")
+
+                    if sent_batches > 0:
+                        restrict_display = "公開" if restrict == "public" else "非公開"
+                        forward = "转发消息" if config.forward_threshold else "普通消息"
+                        return (
+                            f"📚 {restrict_display}收藏来了喵！"
+                            f" 发送了 {len(filtered_items)} 张作品 ({forward})。"
+                        )
+                    return "获取收藏成功但发送失败喵(ΦωΦ;)✧"
+                except Exception as e:
+                    logger.error(f"发送收藏失败: {e}")
+                    # 降级到文字描述喵
+                    restrict_display = "公开" if restrict == "public" else "非公开"
+                    lines = [f"📚 {restrict_display}收藏喵："]
+                    for ill in to_show:
+                        title = getattr(ill, "title", "未命名")
+                        user_name = getattr(getattr(ill, "user", None), "name", "未知")
+                        bookmarks = getattr(ill, "total_bookmarks", 0)
+                        lines.append(f"  [{ill.id}] {title} by {user_name} (⭐{bookmarks})")
+                    return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"Pixiv查看收藏失败: {e}")
+            return f"查看收藏失败: {str(e)}"
+
+    def _get_event(self, context: ContextWrapper[AstrAgentContext]):
+        """从context中获取event喵"""
+        try:
+            if (
+                hasattr(context, "event")
+                and context.event
+                and hasattr(context.event, "send")
+            ):
+                return context.event
+        except Exception:
+            pass
+        return None
